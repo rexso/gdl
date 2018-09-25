@@ -131,7 +131,7 @@ namespace lib
             fclose(fptr);
             verNum_ = head.tiff_version;
 
-            union { uint16_t w; uint8_t b[2]; } u = { 0xBEEF };
+            union { uint16 w; uint8 b[2]; } u = { 0xBEEF };
             static bool big = (u.b[0] == 0xBE && u.b[1] == 0xEF);
 
             if(head.tiff_magic == TIFF_BIGENDIAN && !big)
@@ -229,20 +229,28 @@ namespace lib
             return (tiff_ ? verNum_ : 0);
         }
 
-        typedef void (*ScanlineFn)(BaseGDL*, uint32, uint32, const void*, size_t);
+        typedef void (*ScanlineFn)(BaseGDL*, int8, uint32, uint32, const void*, size_t);
         template<typename T>
         ScanlineFn createScanlineFn(BaseGDL*& var, T* val)
         {
             if(!(var = val))
                 return nullptr;
 
-            return [](BaseGDL* image, uint32 x, uint32 y, const void* buf, size_t bytes) {
+            return [](BaseGDL* image, int8 band, uint32 x, uint32 y, const void* buf, size_t bytes) {
                 auto img = static_cast<T*>(image);
                 auto ptr = reinterpret_cast<typename T::Ty*>(img->DataAddr());
                 auto dim = img->Dim();
-                auto w = dim[dim.Rank() - 2];
-                auto c = dim.Rank() > 2 ? dim[0] : 1;
-                memcpy(ptr + (y * w + x) * c, buf, bytes);
+
+                if(~band) {
+                    auto w = dim[0];
+                    auto h = dim[1];
+                    memcpy(ptr + (w * h * band) + (y * w + x), buf, bytes);
+                }
+                else {
+                    auto w = dim[dim.Rank() - 2];
+                    auto c = (dim.Rank() > 2 ? dim[0] : 1);
+                    memcpy(ptr + (y * w + x) * c, buf, bytes);
+                }
             };
         }
 
@@ -251,14 +259,20 @@ namespace lib
             uint32 c = dir.samplesPerPixel;
             uint32 w = (rect.w ? rect.w : dir.width - rect.x);
             uint32 h = (rect.h ? rect.h : dir.height - rect.y);
+            uint8 bands = (dir.planarConfig == Directory::PlanarConfig::Separate ? c : 1);
 
             ScanlineFn addScanline;
             BaseGDL* image = nullptr;
             dimension dim(w, h);
 
             if(c > 1) {
-                SizeT ndim[3] = { c, w, h };
-                dim = dimension(ndim, 3);
+                if(bands > 1) {
+                    SizeT ndim[3] = { w, h, c };
+                    dim = dimension(ndim, 3);
+                } else {
+                    SizeT ndim[3] = { c, w, h };
+                    dim = dimension(ndim, 3);
+                }
             }
 
             switch(dir.PixelType()) {
@@ -278,7 +292,10 @@ namespace lib
             }
 
             char *buffer = nullptr, *start;
-            ptrdiff_t sampOff = (c * (dir.bitsPerSample >= 8 ? (dir.bitsPerSample / 8) : 1));
+            ptrdiff_t sampOff = (dir.bitsPerSample >= 8 ? (dir.bitsPerSample / 8) : 1);
+
+            if(bands == 1)
+                sampOff *= c;
 
             // Scanline-based images
             if(!TIFFIsTiled(tiff_)) {
@@ -289,12 +306,14 @@ namespace lib
                     goto error;
                 }
 
-                for(uint32 y = 0; y < h; ++y) {
-                    if(TIFFReadScanline(tiff_, buffer, rect.y + y, 0) == -1)
-                        goto error;
+                for(uint8 b = 0; b < bands; ++b) {
+                    for(uint32 y = 0; y < h; ++y) {
+                        if(TIFFReadScanline(tiff_, buffer, rect.y + y, b) == -1)
+                            goto error;
 
-                    start = buffer + (sampOff * rect.x);
-                    addScanline(image, 0, y, start, sampOff * w);
+                        start = buffer + (sampOff * rect.x);
+                        addScanline(image, (bands > 1 ? b : -1), 0, y, start, sampOff * w);
+                    }
                 }
             }
 
@@ -307,30 +326,39 @@ namespace lib
                     goto error;
                 }
 
-                for(uint32 y = 0, yrem, yoff; y < h; y += yrem) {
-                    yoff = (rect.y + y) % dir.tileHeight;
+                for(uint8 b = 0; b < bands; ++b) {
+                    for(uint32 y = 0, yrem, yoff; y < h; y += yrem) {
+                        yoff = (rect.y + y) % dir.tileHeight;
 
-                    if(((yrem = dir.tileHeight - yoff) + y) > h)
-                        yrem = h - y;
+                        if(((yrem = dir.tileHeight - yoff) + y) > h)
+                            yrem = h - y;
 
-                    for(uint32 x = 0, xrem, xoff; x < w; x += xrem) {
-                        if(TIFFReadTile(tiff_, buffer, rect.x + x, rect.y + y, 0, 0) == -1)
-                            goto error;
+                        for(uint32 x = 0, xrem, xoff; x < w; x += xrem) {
+                            if(TIFFReadTile(tiff_, buffer, rect.x + x, rect.y + y, 0, b) == -1)
+                                goto error;
 
-                        xoff = (rect.x + x) % dir.tileWidth;
-                        start = buffer + (sampOff * ((yoff * dir.tileWidth) + xoff));
+                            xoff = (rect.x + x) % dir.tileWidth;
+                            start = buffer + (sampOff * ((yoff * dir.tileWidth) + xoff));
 
-                        if(((xrem = dir.tileWidth - xoff) + x) > w)
-                            xrem = w - x;
+                            if(((xrem = dir.tileWidth - xoff) + x) > w)
+                                xrem = w - x;
 
-                        for(uint32 ty = 0; ty < yrem; ++ty, start += (sampOff * dir.tileWidth))
-                            addScanline(image, x, y + ty, start, sampOff * xrem);
+                            for(uint32 ty = 0; ty < yrem; ++ty, start += (sampOff * dir.tileWidth))
+                                addScanline(image, (bands > 1 ? b : -1), x, y + ty, start, sampOff * xrem);
+                        }
                     }
                 }
             }
 
             if(buffer)
                 _TIFFfree(buffer);
+
+            if(bands > 1) {
+                DUInt t[] = { 2, 0, 1 };
+                auto temp = image->Transpose(t);
+                delete image;
+                image = temp;
+            }
 
             return image;
 
@@ -579,48 +607,6 @@ namespace lib
 
             TIFF::Rectangle rect = { 0, 0, dir.width, dir.height };
 
-            // TODO: Plane interleaved images
-            if(dir.planarConfig == TIFF::Directory::PlanarConfig::Separate) {
-                e->Throw("Plane interleaved images not yet supported");
-
-                /*
-                If the TIFF file is written as a three-channel image, interleaved by plane, and the R, G, and B parameters are present,
-                the three channels of the image are returned in the R, G, and B variables.
-
-                As a special case, for three-channel TIFF image files that are stored in planar interleave format,
-                and if four parameters are provided, READ_TIFF returns the integer value zero,
-                and returns three separate images in the variables defined by the R, G, and B arguments.
-                */
-
-                return new DLongGDL(0);
-            }
-
-            // Palette coloured images
-            else if(dir.photometric == TIFF::Directory::Photometric::Palette) {
-                if(!(dir.bitsPerSample == 16 && dir.samplesPerPixel == 3))
-                    e->Throw("Palettes only supported for 3 channel images with 16 bits per pixel");
-
-                size_t count = (2 << (dir.bitsPerSample - 1));
-
-                static int rIx = e->KeywordIx("RED");
-                if(e->KeywordSet(rIx)) {
-                    if(dir.colorMap.red) e->SetKW(rIx, new DUIntGDL(dir.colorMap.red, count));
-                    else e->Throw("RED colormap missing in TIFF file");
-                }
-
-                static int gIx = e->KeywordIx("GREEN");
-                if(e->KeywordSet(gIx)) {
-                    if(dir.colorMap.green) e->SetKW(gIx, new DUIntGDL(dir.colorMap.green, count));
-                    else e->Throw("GREEN colormap missing in TIFF file");
-                }
-
-                static int bIx = e->KeywordIx("BLUE");
-                if(e->KeywordSet(bIx)) {
-                    if(dir.colorMap.blue) e->SetKW(bIx, new DUIntGDL(dir.colorMap.blue, count));
-                    else e->Throw("BLUE colormap missing in TIFF file");
-                }
-            }
-
             // Use exclicitly defined sub rectangle if present
             static int subRectIx = e->KeywordIx("SUB_RECT");
             if(e->KeywordSet(subRectIx)) {
@@ -637,9 +623,6 @@ namespace lib
                 if((rect.x + rect.w > dir.width) || (rect.y + rect.h > dir.height))
                     e->Throw("Invalid SUB_RECT value exeeds image dimensions");
             }
-
-            if(!(image = tiff.ReadImage(dir, rect)))
-                e->Throw("Failed to read TIFF image with defined parameters");
 
             static int dotRangeIx = e->KeywordIx("DOT_RANGE");
             if(e->KeywordPresent(dotRangeIx)) {
@@ -697,10 +680,58 @@ namespace lib
             if(e->KeywordPresent(planarConfigIx)) {
                 e->SetKW(planarConfigIx, new DLongGDL(enumIntegralValue(dir.planarConfig)));
             }
-       }
 
-       return image;
-   }
+            if(!(image = tiff.ReadImage(dir, rect)))
+                e->Throw("Failed to read TIFF image with defined parameters");
+
+            // Special treatment for images with three channels
+            if(dir.samplesPerPixel == 3) {
+                static int rIx = e->KeywordIx("RED");
+                static int gIx = e->KeywordIx("GREEN");
+                static int bIx = e->KeywordIx("BLUE");
+
+                // Palette coloured images
+                if(dir.photometric == TIFF::Directory::Photometric::Palette) {
+                    if(dir.bitsPerSample != 16)
+                        e->Throw("Palettes only supported for 3 channel images with 16 bits per pixel");
+
+                    size_t count = (2 << (dir.bitsPerSample - 1));
+
+                    if(e->KeywordSet(rIx)) {
+                        if(dir.colorMap.red) e->SetKW(rIx, new DUIntGDL(dir.colorMap.red, count));
+                        else e->Throw("RED colormap missing in TIFF file");
+                    }
+
+                    if(e->KeywordSet(gIx)) {
+                        if(dir.colorMap.green) e->SetKW(gIx, new DUIntGDL(dir.colorMap.green, count));
+                        else e->Throw("GREEN colormap missing in TIFF file");
+                    }
+
+                    if(e->KeywordSet(bIx)) {
+                        if(dir.colorMap.blue) e->SetKW(bIx, new DUIntGDL(dir.colorMap.blue, count));
+                        else e->Throw("BLUE colormap missing in TIFF file");
+                    }
+                }
+
+                // Plane interleaved images
+                else if(dir.planarConfig == TIFF::Directory::PlanarConfig::Separate) {
+                    if(e->KeywordSet(rIx))
+                        e->SetKW(rIx, image[0].Dup());
+
+                    if(e->KeywordSet(gIx))
+                        e->SetKW(gIx, image[1].Dup());
+
+                    if(e->KeywordSet(bIx))
+                        e->SetKW(bIx, image[2].Dup());
+
+                    delete image;
+                    return new DLongGDL(0);
+                }
+            }
+        }
+
+        return image;
+    }
 }
 
 #endif

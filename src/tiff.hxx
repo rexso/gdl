@@ -129,16 +129,16 @@ namespace lib
 
             union
             {
-                int8_t*     b;
-                int16_t*    i;
-                int32_t*    l;
-                uint8_t*    ub;
-                uint16_t*   ui;
-                uint32_t*   ul;
-                float*      f;
-                double*     d;
-                char*       str;
-                void*       ptr;
+                int8*   b;
+                int16*  i;
+                int32*  l;
+                uint8*  ub;
+                uint16* ui;
+                uint32* ul;
+                float*  f;
+                double* d;
+                char*   str;
+                void*   ptr;
             } value             = { 0 };
 
             tagtype_t   type    = TYPE_UNKNOWN;
